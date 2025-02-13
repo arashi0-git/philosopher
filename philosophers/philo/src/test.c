@@ -5,143 +5,330 @@
 /*                                                    +:+ +:+         +:+     */
 /*   By: aryamamo <aryamamo@student.42.fr>          +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
-/*   Created: 2025/02/11 13:19:05 by aryamamo          #+#    #+#             */
-/*   Updated: 2025/02/11 13:19:30 by aryamamo         ###   ########.fr       */
+/*   Created: 2025/02/13 13:27:28 by aryamamo          #+#    #+#             */
+/*   Updated: 2025/02/13 13:29:13 by aryamamo         ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h> // memset
 #include <sys/time.h>
-#include <unistd.h> // usleep, write
+#include <unistd.h>
 
-/* 使用可能な関数のみ：
-memset, printf, malloc, free, write, usleep, gettimeofday,
-pthread_create, pthread_detach, pthread_join,
-pthread_mutex_init, pthread_mutex_destroy, pthread_mutex_lock,
-	pthread_mutex_unlock
-*/
+/* ************************************************************************** */
+/*                              STRUCT DEFINITIONS                            */
+/* ************************************************************************** */
 
-// 自作の文字列長計算関数 (strlenの代替)
-size_t	my_strlen(const char *s)
+typedef struct s_params			t_params;
+typedef struct s_philosopher	t_philosopher;
+
+struct							s_params
 {
-	size_t	len;
+	int num_philos;     // number of philosophers (and forks)
+	long time_to_die;   // in ms
+	long time_to_eat;   // in ms
+	long time_to_sleep; // in ms
+	int							must_eat;
 
-	len = 0;
-	while (s[len] != '\0')
-	{
-		len++;
-	}
-	return (len);
+	int							must_eat_flag;
+	long start_time;         // simulation start time in ms
+	int simulation_end;      // flag: 1 when simulation stops
+	pthread_mutex_t logging; // mutex to protect printing
+	pthread_mutex_t				simulation_lock;
+	pthread_mutex_t *forks; // array of mutexes (one per fork)
+};
+
+struct							s_philosopher
+{
+	int id; // philosopher number (1-indexed)
+	long						last_meal;
+	int meals_eaten;             // counter for number of meals eaten
+	t_params *params;            // pointer to shared simulation parameters
+	pthread_mutex_t *left_fork;  // pointer to the left fork (mutex)
+	pthread_mutex_t *right_fork; // pointer to the right fork (mutex)
+};
+
+/* ************************************************************************** */
+/*                              UTILITY FUNCTIONS                             */
+/* ************************************************************************** */
+
+// Returns current timestamp in ms.
+long	get_time_ms(void)
+{
+	struct timeval	tv;
+
+	gettimeofday(&tv, NULL);
+	return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
 }
 
-// スレッドに渡すデータ構造
-typedef struct
+// Returns timestamp relative to simulation start.
+long	get_timestamp(t_params *params)
 {
-	int id;                       // 人を識別するID
-	pthread_mutex_t *print_mutex; // 出力時の排他制御用ミューテックスへのポインタ
-}		person_data_t;
+	return (get_time_ms() - params->start_time);
+}
 
-// スレッドで実行する関数
-void	*person_thread(void *arg)
+// Logs a philosopher’s action with a timestamp.
+// The logging mutex ensures messages are not mixed up.
+void	log_action(t_philosopher *phil, const char *action)
 {
-	person_data_t	*pdata;
-	int				id;
-	struct timeval	tv;
-	const char		*msg = "Person thread: Work done.\n";
+	pthread_mutex_lock(&phil->params->logging);
+	// Only print if simulation is still running.
+	if (!phil->params->simulation_end)
+		printf("%ld %d %s\n", get_timestamp(phil->params), phil->id, action);
+	pthread_mutex_unlock(&phil->params->logging);
+}
 
-	pdata = (person_data_t *)arg;
-	id = pdata->id;
-	// ミューテックスで保護してメッセージ出力
-	pthread_mutex_lock(pdata->print_mutex);
-	printf("Person %d: Thread start.\n", id);
-	pthread_mutex_unlock(pdata->print_mutex);
-	// 現在時刻を取得
-	gettimeofday(&tv, NULL);
-	pthread_mutex_lock(pdata->print_mutex);
-	printf("Person %d: Current time = %ld sec, %ld microsec\n", id, tv.tv_sec,
-		tv.tv_usec);
-	pthread_mutex_unlock(pdata->print_mutex);
-	// usleepで処理の模擬（0.5秒待機）
-	usleep(500000);
-	// writeを用いてメッセージを出力
-	write(STDOUT_FILENO, msg, my_strlen(msg));
-	pthread_mutex_lock(pdata->print_mutex);
-	printf("Person %d: Thread end.\n", id);
-	pthread_mutex_unlock(pdata->print_mutex);
+// Sleeps for the given number of milliseconds.
+void	msleep(long ms)
+{
+	long	start;
+
+	start = get_time_ms();
+	while (get_time_ms() - start < ms)
+		usleep(100); // sleep for 100 microseconds to avoid busy waiting
+}
+
+/* ************************************************************************** */
+/*                          PHILOSOPHER THREAD ROUTINE                        */
+/* ************************************************************************** */
+
+void	*philosopher_routine(void *arg)
+{
+	t_philosopher	*phil;
+	t_params		*params;
+
+	phil = (t_philosopher *)arg;
+	params = phil->params;
+	// Special case: if there is only one philosopher,
+	if (params->num_philos == 1)
+	{
+		pthread_mutex_lock(phil->left_fork);
+		log_action(phil, "has taken a fork");
+		msleep(params->time_to_die);
+		// he will starve waiting for the second fork.
+		pthread_mutex_unlock(phil->left_fork);
+		return (NULL);
+	}
+	// Stagger start for even-numbered philosophers to help avoid deadlocks.
+	if (phil->id % 2 == 0)
+		usleep(1000);
+	while (1)
+	{
+		// Check if simulation has ended.
+		pthread_mutex_lock(&params->simulation_lock);
+		if (params->simulation_end)
+		{
+			pthread_mutex_unlock(&params->simulation_lock);
+			break ;
+		}
+		pthread_mutex_unlock(&params->simulation_lock);
+		/* --------------------------- TAKE FORKS --------------------------- */
+		// To avoid deadlock,
+		if (phil->id % 2 == 0)
+		{
+			pthread_mutex_lock(phil->right_fork);
+			log_action(phil, "has taken a fork");
+			pthread_mutex_lock(phil->left_fork);
+			log_action(phil, "has taken a fork");
+		}
+		else
+		{
+			pthread_mutex_lock(phil->left_fork);
+			log_action(phil, "has taken a fork");
+			pthread_mutex_lock(phil->right_fork);
+			log_action(phil, "has taken a fork");
+		}
+		/* ---------------------------- EATING ------------------------------ */
+		pthread_mutex_lock(&params->simulation_lock);
+		phil->last_meal = get_time_ms();
+		pthread_mutex_unlock(&params->simulation_lock);
+		log_action(phil, "is eating");
+		msleep(params->time_to_eat);
+		phil->meals_eaten++;
+		// Release the forks after eating.
+		pthread_mutex_unlock(phil->left_fork);
+		pthread_mutex_unlock(phil->right_fork);
+		// If an optional number of meals is provided and reached, exit.
+		if (params->must_eat_flag && (phil->meals_eaten >= params->must_eat))
+			break ;
+		/* --------------------------- SLEEPING ----------------------------- */
+		log_action(phil, "is sleeping");
+		msleep(params->time_to_sleep);
+		/* -------------------------- THINKING ------------------------------ */
+		log_action(phil, "is thinking");
+	}
 	return (NULL);
 }
 
-int	main(void)
-{
-	pthread_mutex_t	print_mutex;
-	person_data_t	*pdata1;
-	pthread_t		thread1;
-	person_data_t	*pdata2;
-	pthread_t		thread2;
+/* ************************************************************************** */
+/*                         MONITOR THREAD ROUTINE                             */
+/* ************************************************************************** */
 
-	if (pthread_mutex_init(&print_mutex, NULL) != 0)
+// This thread continuously checks whether any philosopher has starved
+// or if all philosophers have eaten enough (when the optional argument is provided).
+void	*monitor_routine(void *arg)
+{
+	t_philosopher	*phils;
+	t_params		*params;
+	int				i;
+	long			time_since_last_meal;
+	int				all_done;
+
+	phils = (t_philosopher *)arg;
+	params = phils[0].params;
+	while (1)
 	{
-		printf("Mutex initialization failed.\n");
+		for (i = 0; i < params->num_philos; i++)
+		{
+			pthread_mutex_lock(&params->simulation_lock);
+			time_since_last_meal = get_time_ms() - phils[i].last_meal;
+			if (!params->simulation_end
+				&& time_since_last_meal > params->time_to_die)
+			{
+				// Log death – ensure this is printed within 10ms of the event.
+				log_action(&phils[i], "died");
+				params->simulation_end = 1;
+				pthread_mutex_unlock(&params->simulation_lock);
+				return (NULL);
+			}
+			pthread_mutex_unlock(&params->simulation_lock);
+		}
+		// Check if all philosophers have eaten enough times.
+		if (params->must_eat_flag)
+		{
+			all_done = 1;
+			for (i = 0; i < params->num_philos; i++)
+			{
+				if (phils[i].meals_eaten < params->must_eat)
+				{
+					all_done = 0;
+					break ;
+				}
+			}
+			if (all_done)
+			{
+				pthread_mutex_lock(&params->simulation_lock);
+				params->simulation_end = 1;
+				pthread_mutex_unlock(&params->simulation_lock);
+				return (NULL);
+			}
+		}
+		usleep(1000); // Check every 1ms
+	}
+	return (NULL);
+}
+
+/* ************************************************************************** */
+/*                         SIMPLE atoi FUNCTION                               */
+/* ************************************************************************** */
+
+int	ft_atoi(const char *str)
+{
+	int		sign;
+	long	result;
+
+	sign = 1;
+	result = 0;
+	while (*str && (*str == ' ' || (*str >= 9 && *str <= 13)))
+		str++;
+	if (*str == '-' || *str == '+')
+	{
+		if (*str == '-')
+			sign = -1;
+		str++;
+	}
+	while (*str && (*str >= '0' && *str <= '9'))
+	{
+		result = result * 10 + (*str - '0');
+		str++;
+	}
+	return (int)(result * sign);
+}
+
+/* ************************************************************************** */
+/*                                  MAIN                                      */
+/* ************************************************************************** */
+
+int	main(int argc, char **argv)
+{
+	int				i;
+	t_params		params;
+	t_philosopher	*philos;
+	pthread_t		*threads;
+	pthread_t		monitor;
+
+	if (argc != 5 && argc != 6)
+	{
+		printf("time_to_die time_to_eat time_to_sleep [number_of_times_each_philosopher_must_eat]\n");
 		return (1);
 	}
-	/* --- join可能なスレッド (Person 1) の作成 --- */
-	pdata1 = (person_data_t *)malloc(sizeof(person_data_t));
-	if (pdata1 == NULL)
+	/* ---------------------- PARSE ARGUMENTS ---------------------- */
+	params.num_philos = ft_atoi(argv[1]);
+	params.time_to_die = ft_atoi(argv[2]);
+	params.time_to_eat = ft_atoi(argv[3]);
+	params.time_to_sleep = ft_atoi(argv[4]);
+	params.must_eat_flag = 0;
+	if (argc == 6)
 	{
-		printf("Memory allocation failed.\n");
-		pthread_mutex_destroy(&print_mutex);
+		params.must_eat = ft_atoi(argv[5]);
+		params.must_eat_flag = 1;
+	}
+	params.simulation_end = 0;
+	params.start_time = get_time_ms();
+	pthread_mutex_init(&params.logging, NULL);
+	pthread_mutex_init(&params.simulation_lock, NULL);
+	/* -------------------- INITIALIZE FORKS ----------------------- */
+	params.forks = malloc(sizeof(pthread_mutex_t) * params.num_philos);
+	if (!params.forks)
+		return (1);
+	for (i = 0; i < params.num_philos; i++)
+		pthread_mutex_init(&params.forks[i], NULL);
+	/* -------------------- INITIALIZE PHILOSOPHERS ------------------ */
+	philos = malloc(sizeof(t_philosopher) * params.num_philos);
+	threads = malloc(sizeof(pthread_t) * params.num_philos);
+	if (!philos || !threads)
+		return (1);
+	i = 0;
+	while (i < params.num_philos)
+	{
+		philos[i].id = i + 1;
+		philos[i].meals_eaten = 0;
+		philos[i].params = &params;
+		philos[i].last_meal = params.start_time;
+		// In this circular table, each philosopher’s left fork is forks[i] and
+		// the right fork is forks[(i + 1) % num_philos].
+		philos[i].left_fork = &params.forks[i];
+		philos[i].right_fork = &params.forks[(i + 1) % params.num_philos];
+		if (pthread_create(&threads[i], NULL, philosopher_routine,
+				&philos[i]) != 0)
+		{
+			perror("pthread_create");
+			return (1);
+		}
+		i++;
+	}
+	/* --------------------- CREATE MONITOR THREAD --------------------- */
+	if (pthread_create(&monitor, NULL, monitor_routine, philos) != 0)
+	{
+		perror("pthread_create");
 		return (1);
 	}
-	memset(pdata1, 0, sizeof(person_data_t));
-	pdata1->id = 1;
-	pdata1->print_mutex = &print_mutex;
-	if (pthread_create(&thread1, NULL, person_thread, pdata1) != 0)
+	/* ---------------------- WAIT FOR THREADS ------------------------- */
+	pthread_join(monitor, NULL);
+	for (i = 0; i < params.num_philos; i++)
+		pthread_join(threads[i], NULL);
+	/* ------------------------- CLEAN UP ------------------------------ */
+	i = 0;
+	while (i < params.num_philos)
 	{
-		printf("Failed to create thread 1.\n");
-		free(pdata1);
-		pthread_mutex_destroy(&print_mutex);
-		return (1);
+		pthread_mutex_destroy(&params.forks[i]);
+		i++;
 	}
-	/* --- detachして実行するスレッド (Person 2) の作成 --- */
-	pdata2 = (person_data_t *)malloc(sizeof(person_data_t));
-	if (pdata2 == NULL)
-	{
-		printf("Memory allocation failed.\n");
-		pthread_join(thread1, NULL);
-		free(pdata1);
-		pthread_mutex_destroy(&print_mutex);
-		return (1);
-	}
-	memset(pdata2, 0, sizeof(person_data_t));
-	pdata2->id = 2;
-	pdata2->print_mutex = &print_mutex;
-	if (pthread_create(&thread2, NULL, person_thread, pdata2) != 0)
-	{
-		printf("Failed to create thread 2.\n");
-		free(pdata2);
-		pthread_join(thread1, NULL);
-		free(pdata1);
-		pthread_mutex_destroy(&print_mutex);
-		return (1);
-	}
-	if (pthread_detach(thread2) != 0)
-	{
-		printf("Failed to detach thread 2.\n");
-		// detachに失敗しても続行
-	}
-	// join可能なスレッドの終了待ち
-	if (pthread_join(thread1, NULL) != 0)
-	{
-		printf("Failed to join thread 1.\n");
-	}
-	// detach済みのスレッドはjoinできないため、十分な待ち時間を設ける
-	usleep(1000000); // 1秒待機
-	free(pdata1);
-	free(pdata2);
-	pthread_mutex_destroy(&print_mutex);
-	printf("Main thread: All threads have finished.\n");
+	free(params.forks);
+	free(philos);
+	free(threads);
+	pthread_mutex_destroy(&params.logging);
+	pthread_mutex_destroy(&params.simulation_lock);
 	return (0);
 }
